@@ -38,5 +38,3 @@ def process_temp_data(data):
     # 准备CSV文件的一行数据
     row = [timestamp, tag_id, temp]
     write_row_to_csv(row, "temp_data.csv")
-
-
