@@ -8,7 +8,9 @@ import threading
 from queue import Queue
 
 semaphore_queue = Queue()
-MQTT_TOPICS = [("uwb/data", 0), ("imu/data", 0), ("tmp/data", 0), ("uwb/semaphore", 0)]
+
+MQTT_TOPICS = [("uwb/data", 0), ("imu/data", 0), ("tmp/data", 0), ("uwb/semaphore", 0), ("tdma/slot", 0)]
+
 executor = ThreadPoolExecutor(max_workers=60)
 semaphore_holder = None
 active_tags = set()
@@ -19,10 +21,44 @@ last_heartbeats = {}
 # 设置日志记录
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+time_slots = {}
+
+def allocate_time_slot(tag_id, requested_slot):
+    # 检查请求的时间槽是否已被分配给该标签
+    if time_slots.get(requested_slot) == tag_id:
+        return requested_slot  # 如果是，直接返回该时间槽
+
+    # 分配新的时间槽
+    if requested_slot not in time_slots:
+        time_slots[requested_slot] = tag_id
+        return requested_slot
+    else:
+        for slot in range(1, 5):
+            if slot not in time_slots:
+                time_slots[slot] = tag_id
+                return slot
+    return None  # 所有时间槽都已占用
+
+def handle_tdma_slot_request(client, payload):
+    try:
+        data = json.loads(payload)
+        tag_id = data.get("tagID")
+        requested_slot = data.get("requestedSlot")
+
+        allocated_slot = allocate_time_slot(tag_id, requested_slot)
+        if allocated_slot is not None:
+            response = {"tagID": tag_id, "allocatedSlot": allocated_slot, "duration": 100}  # 添加 duration 字段
+            client.publish("tdma/slot/allocated", json.dumps(response))
+            logger.info(f"Allocated slot {allocated_slot} to tag {tag_id}")
+        else:
+            logger.warning(f"No available slots for tag {tag_id}")
+    except json.JSONDecodeError:
+        logger.error("Error decoding JSON in TDMA slot request")
 
 def on_connect(client, userdata, flags, rc):
     logger.info("Connected with result code " + str(rc))
     client.subscribe(MQTT_TOPICS)
+    client.subscribe("tdma/slot/request")  # 确保订阅正确的主题
     client.subscribe("uwb/tag/add")
     client.subscribe("uwb/tag/remove")
     client.subscribe("uwb/tag/heartbeat")
@@ -39,9 +75,9 @@ def handle_heartbeat_message(payload):
         last_heartbeats[tag_id] = time.time()
         if tag_id not in active_tags:
             active_tags.add(tag_id)
-            logger.info(f"Heartbeat received. Tag added: {tag_id}")
-        else:
-            logger.info(f"Heartbeat received from existing tag: {tag_id}")
+            #logger.info(f"Heartbeat received. Tag added: {tag_id}")
+        #else:
+            #logger.info(f"Heartbeat received from existing tag: {tag_id}")
     else:
         logger.error("Heartbeat message without tagID")
 
@@ -63,6 +99,9 @@ def process_message(client, userdata, msg):
         logger.info("Received message on topic {}: {}".format(msg.topic, payload))
         data = json.loads(payload)
 
+        # 打印接收到的数据
+        logger.info(f"Received data on topic {msg.topic}: {data}")
+
         if msg.topic == "uwb/data":
             process_data(data)
         elif msg.topic == "imu/data":
@@ -71,7 +110,6 @@ def process_message(client, userdata, msg):
             process_temp_data(data)
     except Exception as e:
         logger.error(f"Error processing message: {e}")
-
 
 def process_semaphore_message(client, userdata, msg):
     global semaphore_holder
@@ -101,14 +139,14 @@ def on_message(client, userdata, msg):
     try:
         if msg.topic in ["uwb/data", "imu/data", "tmp/data"]:
             executor.submit(process_message, client, userdata, msg)
-        elif msg.topic == "uwb/semaphore":
-            executor.submit(process_semaphore_message, client, userdata, msg)
-        if msg.topic == "uwb/tag/add":
+        elif msg.topic == "uwb/tag/add":
             handle_tag_addition(msg.payload.decode())
         elif msg.topic == "uwb/tag/remove":
             handle_tag_removal(msg.payload.decode())
-        if msg.topic == "uwb/tag/heartbeat":
+        elif msg.topic == "uwb/tag/heartbeat":
             handle_heartbeat_message(msg.payload.decode())
+        elif msg.topic == "tdma/slot/request":
+            handle_tdma_slot_request(client, msg.payload.decode())
     except Exception as e:
         logger.error(f"Error processing message: {e}")
 
@@ -150,5 +188,3 @@ def send_active_tags(client):
     logger.info(f"Active tags list published: {data}")
     # 每隔一段时间发送一次
     threading.Timer(60, send_active_tags, [client]).start()
-
-
